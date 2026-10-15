@@ -48,7 +48,7 @@ test('callTool：plan / lint 只读，返回中文且无密钥值；apply 缺省
   const real = await callTool('memory_tidy_apply', { confirm: true }, root)
   assert.ok(!real.isError, text(real))
   assert.match(text(real), /已执行/)
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM cards').get().n, total0 - 5)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM cards').get().n, total0 - 6)
   const tn = text(await callTool('memory_tag_normalize', { synonyms: { oncall: 'combo' } }, root))
   assert.match(tn, /预演|无需/)
 })

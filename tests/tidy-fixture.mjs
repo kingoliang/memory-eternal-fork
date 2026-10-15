@@ -48,8 +48,10 @@ export async function buildFixture() {
   ids.other = insertCard(db, { path: '02-Projects/other.md', kind: 'project', title: '无关项目', tags: ['other'], body: '# 无关项目\n\n' + cjk(300) })
   // 噪声（均为 raw）
   ids.n1 = insertCard(db, { path: '04-Content/n1.md', kind: 'content', title: '[SCHEDULE REMINDER] 例行', tags: ['raw'], body: '[SCHEDULE REMINDER] ' + cjk(200) })
-  ids.n2 = insertCard(db, { path: '04-Content/n2.md', kind: 'content', title: '[SCHEDULE REMINDER] 例行二', tags: ['raw'], body: '[SCHEDULE REMINDER] ' + cjk(200) })
+  ids.n2 = insertCard(db, { path: '04-Content/n2.md', kind: 'content', title: '[SCHEDULE REMINDER BATCH]', tags: ['raw'], body: '用户：[SCHEDULE REMINDER BATCH] This is a scheduled message ' + cjk(200) })
   ids.n3 = insertCard(db, { path: '04-Content/n3.md', kind: 'content', title: 'hello', tags: ['raw'], body: 'hello' })
+  // 探针卡：标题是 hello，正文有一长串但无信息（真实库里出现过）
+  ids.n4 = insertCard(db, { path: '04-Content/n4.md', kind: 'content', title: 'Reply with the single word pong', tags: ['raw', 'distill-failed'], body: '用户：Reply with the single word pong\n' + cjk(400) })
   // 非 raw 的短卡：不是噪声（安全边界）
   ids.shortKeep = insertCard(db, { path: '03-Knowledge/short-keep.md', kind: 'knowledge', title: '短但有用', tags: ['note'], body: '端口 7999' })
   // 标签变体

@@ -32,7 +32,7 @@ test('tidyPlan：只读，且覆盖五类发现', async () => {
   assert.equal(fingerprint(db), before, 'plan 不得改库')
   // 噪声：2 个 reminder + 1 个 hello(raw)；非 raw 短卡不算；大 raw 不算噪声
   const noisePaths = plan.noise.map((n) => n.path).sort()
-  assert.deepEqual(noisePaths, ['04-Content/n1.md', '04-Content/n2.md', '04-Content/n3.md'])
+  assert.deepEqual(noisePaths, ['04-Content/n1.md', '04-Content/n2.md', '04-Content/n3.md', '04-Content/n4.md'])
   assert.ok(!noisePaths.includes('03-Knowledge/short-keep.md'))
   // 重复：保留最长 canon，吸收 dup1/dup2，无关卡不在内
   assert.equal(plan.duplicates.length, 1)
@@ -75,6 +75,8 @@ test('tidyApply：默认 dry-run（不改库、不备份）', async () => {
 test('tidyApply confirm：备份 → 软删 → 合并保留独特信息 → 自检 → 可召回 → 可恢复', async () => {
   const { root, db, ids, U1, U2 } = await buildFixture()
   const total0 = db.prepare('SELECT COUNT(*) n FROM cards').get().n
+  const content = () => JSON.stringify(db.prepare('SELECT path, kind, title, tags, body FROM cards ORDER BY path').all())
+  const contentBefore = content()
   const res = await tidyApply(root, { ...quiet, confirm: true })
   assert.equal(res.ok, true, JSON.stringify(res))
   assert.equal(res.dryRun, false)
@@ -89,8 +91,8 @@ test('tidyApply confirm：备份 → 软删 → 合并保留独特信息 → 自
   assert.deepEqual(res.batches.map((b) => [b.name, b.status]), [['noise', 'applied'], ['merge', 'applied'], ['tags', 'applied']])
   // 删除只走软删：回收站里能找到，且主库不再有
   const del = db.prepare("SELECT path FROM quarantine WHERE status='deleted' ORDER BY path").all().map((r) => r.path)
-  assert.deepEqual(del, ['02-Projects/sop-dup1.md', '02-Projects/sop-dup2.md', '04-Content/n1.md', '04-Content/n2.md', '04-Content/n3.md'])
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM cards').get().n, total0 - 5)
+  assert.deepEqual(del, ['02-Projects/sop-dup1.md', '02-Projects/sop-dup2.md', '04-Content/n1.md', '04-Content/n2.md', '04-Content/n3.md', '04-Content/n4.md'])
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM cards').get().n, total0 - 6)
   // 合并保留独特信息，且仍可被 recall 召回
   const canon = db.prepare("SELECT body, tags FROM cards WHERE path='02-Projects/sop-canon.md'").get()
   assert.ok(canon.body.includes(U1) && canon.body.includes(U2))
@@ -100,8 +102,8 @@ test('tidyApply confirm：备份 → 软删 → 合并保留独特信息 → 自
   assert.ok(hits.some((h) => h.path === '02-Projects/sop-canon.md'))
   // 对账：stats 与库一致、主库不变量
   const s = await stats(root)
-  assert.equal(s.total, total0 - 5)
-  assert.equal(s.quarantine.deleted, 5)
+  assert.equal(s.total, total0 - 6)
+  assert.equal(s.quarantine.deleted, 6)
   assert.equal(checkMainStoreInvariant(root).ok, true)
   // 审计日志留痕
   assert.ok(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE changed_by='tidy'").get().n >= 5)
@@ -113,6 +115,7 @@ test('tidyApply confirm：备份 → 软删 → 合并保留独特信息 → 自
   const canon2 = db.prepare("SELECT body FROM cards WHERE path='02-Projects/sop-canon.md'").get()
   assert.ok(!canon2.body.includes(U1))
   assert.equal(JSON.parse(db.prepare("SELECT tags FROM cards WHERE path='07-Tools/t3.md'").get().tags).length, 6)
+  assert.equal(content(), contentBefore, '回滚后每张卡的 path/kind/title/tags/body 与整理前逐字一致')
 })
 
 test('tidyApply：整理后幂等（再 plan 无噪声/重复/标签变更）', async () => {
@@ -173,7 +176,7 @@ test('tidyLint：只读指标，不含密钥值', async () => {
   const m = await tidyLint(root, quiet)
   assert.equal(fingerprint(db), before)
   assert.equal(m.total, db.prepare('SELECT COUNT(*) n FROM cards').get().n)
-  assert.equal(m.noise, 3)
+  assert.equal(m.noise, 4)
   assert.equal(m.duplicateGroups, 1)
   assert.equal(m.duplicateAbsorbable, 2)
   assert.equal(m.secretSuspects, 3)
@@ -196,8 +199,16 @@ test('tagNormalize：默认 dry-run；confirm 才改；支持自定义同义映�
   assert.equal(res.ok, true, JSON.stringify(res))
   const tags = (p) => JSON.parse(db.prepare('SELECT tags FROM cards WHERE path=?').get(p).tags)
   assert.deepEqual(tags('02-Projects/sop-dup2.md'), ['combo'])
-  assert.deepEqual(tags('07-Tools/t1.md').sort(), ['docker', 'docker-compose'].sort())
+  assert.deepEqual(tags('07-Tools/t1.md').sort(), ['docker', 'docker compose'].sort())
   assert.ok(existsSync(res.backup.path))
   // 只动标签：没有任何卡被删
   assert.equal(db.prepare("SELECT COUNT(*) n FROM quarantine WHERE status='deleted'").get().n, 0)
+})
+
+test('planId 来自完整 plan 时，只执行部分批次也能对上', async () => {
+  const { root, db } = await buildFixture()
+  const plan = await tidyPlan(root, quiet)
+  const res = await tidyApply(root, { ...quiet, confirm: true, planId: plan.planId, batches: ['noise'] })
+  assert.equal(res.ok, true, JSON.stringify(res))
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM quarantine WHERE status='deleted'").get().n, 4)
 })

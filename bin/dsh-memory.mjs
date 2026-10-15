@@ -10,6 +10,7 @@
 //   dsh-memory setup [--claude-only|--codex-only|--cursor-only] [--dry-run] [--no-hooks]
 //                                                         自动挂载 MCP 到已装的 agent
 //   dsh-memory sweep <dir>                                挖掘 Claude Code 会话 JSONL
+//   dsh-memory tidy <plan|lint|apply|tags|rollback>       记忆库整理（见 lib/tidy.js）
 //
 // 环境变量：
 //   MEMORY_VAULT_DIR       vault 目录（默认 ~/.dsh/memory-vault）
@@ -291,6 +292,53 @@ MCP 侧只提供只读的 memory_audit_list —— 批准/驳回必须由人显�
       process.exitCode = 1
       return
     }
+    case 'tidy': {
+      // 记忆库整理：plan / lint 只读；apply / tags 默认预演，--confirm 才执行；rollback 依回滚文件还原
+      const sub = argv[1] || ''
+      const { tidyPlan, tidyApply, tidyLint, tagNormalize, tidyRollback, formatTidyPlan, formatTidyApply, formatTidyLint } = await import('../lib/tidy.js')
+      const { defaultVaultDir } = await import('../lib/capture-run.js')
+      const root = path.resolve(argOf('--vault') || defaultVaultDir())
+      const asJson = has('--json')
+      const numArg = (n) => (argOf(n) === null ? undefined : Number(argOf(n)))
+      let synonyms
+      if (argOf('--synonyms')) {
+        try { synonyms = JSON.parse(argOf('--synonyms')) } catch { console.error('--synonyms 需要 JSON，如 \'{"k8s":"kubernetes"}\''); process.exitCode = 1; return }
+      }
+      const common = {
+        threshold: numArg('--threshold'), maxTags: numArg('--max-tags'), rawMaxChars: numArg('--raw-max'),
+        maxDelete: numArg('--max-delete'), synonyms,
+        noiseCategories: argOf('--noise') ? argOf('--noise').split(',').map((x) => x.trim()).filter(Boolean) : undefined,
+      }
+      const show = (res, text) => console.log(asJson ? JSON.stringify(res, null, 2) : text)
+      if (sub === 'plan') { const r = await tidyPlan(root, common); show(r, formatTidyPlan(r, { limit: numArg('--limit') || 15 })); return }
+      if (sub === 'lint') { const r = await tidyLint(root, common); show(r, formatTidyLint(r)); return }
+      if (sub === 'apply' || sub === 'tags') {
+        const batches = argOf('--batches') ? argOf('--batches').split(',').map((x) => x.trim()).filter(Boolean) : undefined
+        const fn = sub === 'tags' ? tagNormalize : tidyApply
+        const r = await fn(root, { ...common, batches, planId: argOf('--plan-id') || undefined, confirm: has('--confirm') })
+        show(r, formatTidyApply(r))
+        process.exitCode = r.ok ? 0 : 1
+        return
+      }
+      if (sub === 'rollback') {
+        const file = argv[2]
+        if (!file || file.startsWith('--')) { console.error('用法：dsh-memory tidy rollback <回滚文件.json> [--vault DIR]'); process.exitCode = 1; return }
+        const r = await tidyRollback(root, path.resolve(file))
+        show(r, r.ok ? `回滚完成：恢复 ${r.restored} 张卡，还原 ${r.reverted} 处正文/标签` : `回滚失败（已撤销）：${r.error}`)
+        process.exitCode = r.ok ? 0 : 1
+        return
+      }
+      console.error(`用法：
+  dsh-memory tidy plan  [--threshold 0.62] [--max-tags 4] [--raw-max 6000] [--noise a,b] [--json] [--vault DIR]   整理计划（只读）
+  dsh-memory tidy lint  [--threshold N] [--json]                                                                  健康检查（只读）
+  dsh-memory tidy apply [--confirm] [--plan-id ID] [--batches noise,merge,tags] [--max-delete 50] [--threshold N]  执行整理（缺省预演）
+  dsh-memory tidy tags  [--confirm] [--synonyms '{"k8s":"kubernetes"}'] [--max-tags 4]                            标签归一（缺省预演）
+  dsh-memory tidy rollback <回滚文件.json>                                                                          依回滚文件还原
+
+说明：--confirm 才真正执行；执行前自动 VACUUM INTO 备份（<vault>/backups/pre-tidy-*.db），删除只进回收站（30 天内可恢复）。`)
+      process.exitCode = 1
+      return
+    }
     case 'watchdog': {
       const { startWatchdog, reapStaleWatchdogs } = await import('../lib/watchdog.js')
       const { defaultVaultDir } = await import('../lib/capture-run.js')
@@ -366,6 +414,7 @@ MCP 侧只提供只读的 memory_audit_list —— 批准/驳回必须由人显�
   dsh-memory restart [--port N] [--vault DIR] 停止并重新拉起看门狗（应用新版本）
   dsh-memory audit list [--status pending] [--kind K] [--json]  列出待审/驳回卡片
   dsh-memory audit approve <path...> | reject <path...> [--reason "原因"]  人工批量审批
+  dsh-memory tidy plan|lint|apply|tags|rollback ...   记忆库整理（apply/tags 缺省预演，--confirm 才执行）
 
 环境变量：MEMORY_VAULT_DIR / MEMORY_LLM_BASE_URL / MEMORY_LLM_KEY / MEMORY_LLM_MODEL`)
   }

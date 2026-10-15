@@ -83,3 +83,16 @@ test('待审队列里已有近似卡：不再堆新的待审卡（跳过并说�
   assert.match(b.reason, /待审/)
   assert.equal(getDb(root).prepare("SELECT COUNT(*) n FROM quarantine WHERE status='pending'").get().n, 1)
 })
+
+test('需要审核的沉淀命中已批准卡：不改正文，只追加更新记录（审核闸门不被绕过），仍不新建卡', async () => {
+  const root = await fresh()
+  // 先用免审环境放一张已批准卡，再换成「全部需审」的环境捕获近似文本
+  const a = await runStandaloneCapture(root, textA, { source: 't', env: await baseEnv() })
+  assert.equal(a.action, 'created')
+  const bodyBefore = rows(root)[0].body
+  const b = await runStandaloneCapture(root, textB, { source: 't', env: await baseEnv({ MEMORY_AUDIT_MODE: 'all' }) })
+  assert.equal(b.action, 'appended'); assert.equal(b.path, a.path)
+  assert.equal(rows(root).length, 1)
+  assert.equal(rows(root)[0].body, bodyBefore, '正文不被未审核内容改写')
+  assert.equal(getDb(root).prepare('SELECT COUNT(*) n FROM card_updates').get().n, 1)
+})
