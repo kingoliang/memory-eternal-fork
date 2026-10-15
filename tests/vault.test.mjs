@@ -1,0 +1,264 @@
+// 记忆核心 · vault 层单元测试（无 DSH 依赖，node 直跑）
+import { test, after } from 'node:test'
+import assert from 'node:assert/strict'
+import { promises as fs } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import {
+  parseCard, safeSlug, textSimilarity, queryTerms, ensureVault, listCards,
+  writeCard, readCard, appendUpdate, search, graph, overview, dedupCheck,
+  stats, optimizeCandidates, searchAll, graphAll, readFeedback, addFeedback, mergeCards, countCards,
+} from '../lib/vault.js'
+import { closeAllDb } from '../lib/db.js'
+
+const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'mc-vault-'))
+after(async () => {
+  closeAllDb()
+  await fs.rm(tmpRoot, { recursive: true, force: true })
+})
+
+let counter = 0
+const freshRoot = async () => {
+  const root = path.join(tmpRoot, `vault-${counter++}`)
+  await ensureVault(root)
+  return root
+}
+
+test('ensureVault creates SQLite database', async () => {
+  const root = await freshRoot()
+  await ensureVault(root)
+  // SQLite 化后 ensureVault 确保 DB 存在（不再是目录结构）
+  const cards = await listCards(root, { status: ['approved', 'pending', 'rejected'] })
+  assert.ok(Array.isArray(cards))
+})
+
+test('parseCard extracts frontmatter + body', () => {
+  const text = `---\nkind: knowledge\ntitle: 测试卡\ntags: [a, b]\ncreated: 2026-01-01\n---\n# 测试卡\n\n内容正文`
+  const { meta, body } = parseCard(text)
+  assert.equal(meta.kind, 'knowledge')
+  assert.equal(meta.title, '测试卡')
+  assert.deepEqual(meta.tags, ['a', 'b'])
+  assert.ok(body.includes('内容正文'))
+})
+
+test('safeSlug keeps CJK and replaces illegal chars', () => {
+  assert.equal(safeSlug('Hello World'), 'hello-world')
+  assert.equal(safeSlug('数据库 选型!'), '数据库-选型')
+  assert.equal(safeSlug(''), 'card')
+})
+
+test('textSimilarity: identical ~1, disjoint ~0', () => {
+  const a = '今天学习强化学习的策略梯度方法，核心是梯度估计'
+  assert.ok(textSimilarity(a, a) > 0.95)
+  assert.ok(textSimilarity(a, '天气很好我们去公园散步吃饭') < 0.1)
+  assert.equal(textSimilarity('', 'abc'), 0)
+})
+
+test('queryTerms: CJK bigram + whole token', () => {
+  const terms = queryTerms('强化学习 蒸馏')
+  assert.ok(terms.has('强化学习'))
+  assert.ok(terms.has('强化'))
+  assert.ok(terms.has('蒸馏'))
+})
+
+test('writeCard + listCards + readCard roundtrip', async () => {
+  const root = await freshRoot()
+  const out = await writeCard(root, {
+    kind: 'knowledge',
+    title: '强化学习基础',
+    tags: ['rl', '机器学习'],
+    body: '策略梯度是一类直接优化策略参数的强化学习方法。\n- 优点：连续动作空间友好\n- 缺点：方差大',
+    source: 'session:test',
+    status: 'approved',
+  })
+  assert.equal(out.ok, true)
+  assert.ok(out.path.startsWith('03-Knowledge/'))
+  const cards = await listCards(root)
+  assert.equal(cards.length, 1)
+  assert.equal(cards[0].title, '强化学习基础')
+  assert.deepEqual(cards[0].tags, ['rl', '机器学习'])
+  const text = (await readCard(root, out.path)).text
+  assert.ok(text.includes('策略梯度'))
+})
+
+test('dedup guard refuses near-duplicate card', async () => {
+  const root = await freshRoot()
+  const bodyA = '我们讨论了PostgreSQL与MySQL的选型问题，最终确定使用PostgreSQL，因为它的扩展性和JSONB支持更好，团队也更熟悉，迁移成本可控。同时我们决定用pgvector做向量检索，与现有ORM集成。'
+  // 近重复：仅追加细节，正文几乎一致 → 应触发去重
+  const bodyB = bodyA + '补充：主从复制用流复制，故障切换由Patroni管理，备份用pgBackRest。'
+  const a = await writeCard(root, { kind: 'knowledge', title: '数据库选型-分析', body: bodyA, status: 'approved' })
+  assert.equal(a.ok, true)
+  const b = await writeCard(root, { kind: 'knowledge', title: '数据库选型-结论', body: bodyB, status: 'approved' })
+  assert.equal(b.ok, false)
+  assert.ok(b.duplicate)
+  const c = await writeCard(root, { kind: 'knowledge', title: '前端构建工具', body: 'vite基于esbuild和rollup，开发体验好，生态成熟，适合中大型项目。HMR极快，配置简单，社区插件丰富。', status: 'approved' })
+  assert.equal(c.ok, true)
+})
+
+test('appendUpdate appends update record and bumps updated', async () => {
+  const root = await freshRoot()
+  const out = await writeCard(root, { kind: 'knowledge', title: '部署方案', body: '使用Docker Compose部署三个服务，Nginx做反代，配置了健康检查。', status: 'approved' })
+  const updated = await appendUpdate(root, out.path, '补充：增加自动扩容策略，基于CPU使用率。')
+  assert.equal(updated.ok, true)
+  const text = (await readCard(root, out.path)).text
+  assert.ok(text.includes('## 更新记录'))
+  assert.ok(text.includes('自动扩容策略'))
+})
+
+test('search: CJK fragment finds cards', async () => {
+  const root = await freshRoot()
+  await writeCard(root, { kind: 'knowledge', title: '强化学习基础', tags: ['rl'], body: '策略梯度是一类直接优化策略参数的强化学习方法。', source: 'session:x', status: 'approved' })
+  const hits = await search(root, '策略梯度')
+  assert.ok(hits.length >= 1)
+  assert.ok(hits[0].title.includes('强化学习'))
+  const miss = await search(root, '量子计算')
+  assert.equal(miss.length, 0)
+})
+
+test('graph: wikilink + shared tag edges', async () => {
+  const root = await freshRoot()
+  await writeCard(root, { kind: 'knowledge', title: '强化学习基础', tags: ['rl'], body: '策略梯度是核心。参考 [[数据库选型]]', source: 'session:x', status: 'approved' })
+  await writeCard(root, { kind: 'knowledge', title: '数据库选型', tags: ['rl'], body: 'PostgreSQL 优于 MySQL。', source: 'session:x', status: 'approved' })
+  const g = await graph(root)
+  assert.equal(g.nodes.length, 2)
+  const linkEdges = g.edges.filter((e) => e.type === 'link')
+  assert.ok(linkEdges.length >= 1, 'wikilink 应产生连线')
+  const tagEdges = g.edges.filter((e) => e.type.startsWith('tag:'))
+  assert.ok(tagEdges.length >= 1, '共享标签应产生连线')
+})
+
+test('overview aggregates counts', async () => {
+  const root = await freshRoot()
+  await writeCard(root, { kind: 'knowledge', title: 'A', body: '内容A足够长以便写入知识库文件。这是关于知识卡片的内容，用于验证数据形状。', status: 'approved' })
+  await writeCard(root, { kind: 'project', title: 'B', body: '项目B的进展与里程碑规划，包括团队分工和交付时间表，用于验证项目类卡片的写入。', status: 'approved' })
+  const ov = await overview(root)
+  assert.equal(ov.total, 2)
+  assert.equal(ov.byKind.knowledge, 1)
+  assert.equal(ov.byKind.project, 1)
+  assert.equal(typeof ov.recent, 'number')
+})
+
+test('dedupCheck finds best match in dir', async () => {
+  const root = await freshRoot()
+  await writeCard(root, { kind: 'knowledge', title: '数据库选型', body: 'PostgreSQL与MySQL选型，结论是PostgreSQL，扩展性与JSONB是关键。团队熟悉，迁移成本可控，向量检索用pgvector。', status: 'approved' })
+  const hit = await dedupCheck(root, 'PostgreSQL与MySQL选型，结论是PostgreSQL，扩展性与JSONB是关键。团队熟悉，迁移成本可控，向量检索用pgvector。', 0.62)
+  assert.ok(hit)
+  assert.ok(hit.path.includes('.md'))
+})
+
+test('stats returns overview + todayCards', async () => {
+  const root = await freshRoot()
+  await writeCard(root, { kind: 'knowledge', title: '知识点A', tags: ['t1'], body: '内容A足够长便于写入知识库文件。', status: 'approved' })
+  const s = await stats(root)
+  assert.equal(s.total, 1)
+  assert.ok(s.today >= 1)
+  assert.ok(s.todayCards.length >= 1)
+  assert.equal(s.byKind.knowledge, 1)
+  assert.equal(typeof s.week, 'number')
+})
+
+test('optimizeCandidates returns merge/stale (non-destructive)', async () => {
+  const root = await freshRoot()
+  const a = '数据库索引B+树的原理与加速机制，索引是数据库为加速查找而额外维护的数据结构。索引加速查询性能。'
+  const b = '数据库索引B+树的原理与加速机制，索引是数据库为加速查找而额外维护的数据结构。索引提升查询速度。'
+  await writeCard(root, { kind: 'knowledge', title: '索引A', tags: [], body: a, status: 'approved' }, { dedup: false })
+  await writeCard(root, { kind: 'knowledge', title: '索引B', tags: [], body: b, status: 'approved' }, { dedup: false })
+  const o = await optimizeCandidates(root)
+  assert.ok(Array.isArray(o.merge))
+  assert.ok(Array.isArray(o.stale))
+  assert.ok(o.merge.length >= 1, '相似卡应进入合并建议')
+})
+
+test('search semantic + minScore + feedback roundtrip', async () => {
+  const root = await freshRoot()
+  await writeCard(root, { kind: 'knowledge', title: 'React性能', tags: [], body: 'React memo 和 useMemo 优化重渲染性能。', status: 'approved' })
+  const hits = await search(root, 'react性能', { limit: 10, semantic: true })
+  assert.ok(hits.length >= 1)
+  await addFeedback(root, { query: 'react性能', path: hits[0].path, useful: true })
+  const fb = await readFeedback(root)
+  assert.ok(fb.length >= 1)
+  assert.equal(fb[0].useful, 1)
+})
+
+test('cross-vault searchAll + graphAll aggregate multiple roots', async () => {
+  const a = await freshRoot(); const b = await freshRoot()
+  await writeCard(a, { kind: 'knowledge', title: 'A卡', tags: [], body: '跨库内容一件大事。', status: 'approved' })
+  await writeCard(b, { kind: 'knowledge', title: 'B卡', tags: [], body: '跨库内容另一件大事。', status: 'approved' })
+  const roots = [{ name: '', root: a }, { name: 'v2', root: b }]
+  const hits = await searchAll(roots, '跨库内容', { limit: 10 })
+  assert.ok(hits.length >= 1)
+  const g = await graphAll(roots)
+  assert.ok(Array.isArray(g.nodes))
+  assert.ok(g.nodes.length >= 1)
+})
+
+test('listCards 真分页：offset/limit/total 一致、无重叠、标题排序跨页全局有序', async () => {
+  const root = await freshRoot()
+  const titles = ['丙卡', '甲卡', '乙卡', '丁卡', '戊卡']
+  for (const t of titles) await writeCard(root, { kind: 'knowledge', title: t, tags: ['p'], body: `${t}的正文内容，用于分页测试，足够长以便入库。`, status: 'approved' }, { dedup: false })
+
+  assert.equal(await countCards(root, {}), 5)
+  const p1 = await listCards(root, { limit: 2, offset: 0 })
+  const p2 = await listCards(root, { limit: 2, offset: 2 })
+  const p3 = await listCards(root, { limit: 2, offset: 4 })
+  assert.equal(p1.length, 2); assert.equal(p2.length, 2); assert.equal(p3.length, 1)
+  const seen = new Set([...p1, ...p2, ...p3].map((c) => c.path))
+  assert.equal(seen.size, 5, '分页结果不得重叠或漏卡')
+
+  const byTitle = await listCards(root, { sort: 'title' })
+  const sorted = byTitle.map((c) => c.title)
+  assert.deepEqual(sorted, [...sorted].sort((a, b) => a.localeCompare(b)), '标题排序应全局有序')
+
+  // 服务端署名过滤：session:* / 空署名 归入 deepseek-harness
+  await writeCard(root, { kind: 'knowledge', title: '宿主卡', tags: ['p'], body: '宿主自动沉淀的卡片正文内容足够长以便入库。', status: 'approved', submittedBy: 'deepseek-harness' }, { dedup: false })
+  await writeCard(root, { kind: 'knowledge', title: '外部卡', tags: ['p'], body: '外部 MCP 客户端写入的卡片正文内容足够长以便入库。', status: 'approved', submittedBy: 'claude-code' }, { dedup: false })
+  // 空署名（上面 5 张）+ 显式 deepseek-harness（宿主卡）= 同一归属桶；claude-code 归 claude
+  assert.equal(await countCards(root, { agent: 'deepseek-harness' }), 6)
+  assert.equal(await countCards(root, { agent: 'claude' }), 1)
+  assert.equal(await countCards(root, { agent: 'codex' }), 0)
+})
+
+test('graph 缓存：指纹失效（写卡/审核后必须重建，不给陈旧数据）', async () => {
+  const root = await freshRoot()
+  await writeCard(root, { kind: 'knowledge', title: '甲', tags: ['t1'], body: '甲卡正文，内容与乙卡不同，用于验证图谱缓存失效。', status: 'approved' }, { dedup: false })
+  const g1 = await graph(root)
+  assert.equal(g1.nodes.length, 1)
+  assert.equal((await graph(root)).nodes.length, 1, '重复调用命中缓存，结果一致')
+  await writeCard(root, { kind: 'knowledge', title: '乙', tags: ['t1'], body: '乙卡正文，与甲卡内容完全不同，写完应立即可见。', status: 'approved' }, { dedup: false })
+  const g2 = await graph(root)
+  assert.equal(g2.nodes.length, 2, '写卡后必须重建（不能返回陈旧图谱）')
+  assert.ok(g2.edges.some((e) => e.type === 'tag:t1'), '共享标签应产生标签边')
+})
+
+test('mergeCards: 合并两张同 kind 卡为一张（保留 kind/并集标签/删除原卡）', async () => {
+  const root = await freshRoot()
+  const a = await writeCard(root, { kind: 'knowledge', title: 'A 卡', tags: ['t1'], body: '内容A足够长便于写入知识库文件。', status: 'approved' }, { dedup: false })
+  const b = await writeCard(root, { kind: 'knowledge', title: 'B 卡', tags: ['t2'], body: '内容B足够长便于写入知识库文件。', status: 'approved' }, { dedup: false })
+  const r = await mergeCards(root, [a.path, b.path])
+  assert.equal(r.ok, true)
+  assert.ok(r.path)
+  // 原 2 张应被删除
+  const cards = await listCards(root, { status: ['approved', 'pending', 'rejected'] })
+  assert.equal(cards.length, 1)
+  // 新卡应保留 kind=knowledge、标签并集、含原文 + 分隔符
+  // 合并产物默认进审核队列（pending），读取需显式放行未审核卡
+  const text = (await readCard(root, cards[0].path, { allowUnapproved: true })).text
+  const { meta, body } = parseCard(text)
+  assert.equal(meta.kind, 'knowledge')
+  assert.ok(meta.tags.includes('t1') && meta.tags.includes('t2'))
+  assert.ok(body.includes('内容A足够长'))
+  assert.ok(body.includes('内容B足够长'))
+  assert.ok(body.includes('---'))
+  assert.ok(meta.title.includes('（合并）'))
+})
+
+test('mergeCards: <2 张卡应返回错误（不执行合并）', async () => {
+  const root = await freshRoot()
+  const a = await writeCard(root, { kind: 'knowledge', title: '单卡', tags: [], body: '单卡正文足够长便于写入知识库文件。', status: 'approved' }, { dedup: false })
+  const r1 = await mergeCards(root, [])
+  assert.equal(r1.ok, false)
+  const r2 = await mergeCards(root, [a.path])
+  assert.equal(r2.ok, false)
+  // 原卡应仍在
+  assert.equal((await listCards(root, { status: ['approved', 'pending', 'rejected'] })).length, 1)
+})
